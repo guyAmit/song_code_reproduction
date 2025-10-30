@@ -125,15 +125,23 @@ class ViT(nn.Module):
         return x
 
 LEARNING_RATE = 0.0001
-ViT_parameters = dict(hidden = 384,
-                        mlp_hidden = 1536,
-                        num_layers = 12,
-                        head = 8,
-                        num_classes = 100,
-                        img_size = 32,
-                        patch_size = 4,
-                        dropout = 0.0,
-                        in_chans = 3 )
+hidden = 384
+mlp_hidden = 1536  
+num_layers = 12
+head = 8
+num_classes = 100
+img_size = 32
+patch_size = 4
+dropout = 0.0
+in_chans = 3  
+
+ViT_parameters = dict(img_size=img_size, patch_size=patch_size, 
+                      in_chans=in_chans, num_classes=num_classes, 
+                      embed_dim=hidden,  depth=num_layers,
+                      num_heads=head, mlp_ratio=(mlp_hidden/hidden),
+                      dropout=dropout)
+
+
 
 # model = ViT(**ViT_parameters)
 
