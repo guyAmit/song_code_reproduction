@@ -2,6 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# Loss for ViT on CIFAR-100 with label smoothing
+class LabelSmoothingCrossEntropyLoss(nn.Module):
+    def __init__(self, classes, smoothing=0.0, dim=-1):
+        super(LabelSmoothingCrossEntropyLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.cls = classes
+        self.dim = dim
+
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=self.dim)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
+        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim)) 
+    
 class PatchEmbed(nn.Module):
     """Split image into patches and then embed them."""
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=384):
@@ -105,3 +123,18 @@ class ViT(nn.Module):
         x = self.head_drop(x)
         x = self.head(x)
         return x
+
+LEARNING_RATE = 0.0001
+ViT_parameters = dict(hidden = 384,
+                        mlp_hidden = 1536,
+                        num_layers = 12,
+                        head = 8,
+                        num_classes = 100,
+                        img_size = 32,
+                        patch_size = 4,
+                        dropout = 0.0,
+                        in_chans = 3 )
+
+# model = ViT(**ViT_parameters)
+
+# optimizer = optim.AdamW(model.parameters(), lr= LEARNING_RATE)
