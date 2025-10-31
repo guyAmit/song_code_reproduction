@@ -1,25 +1,20 @@
 # cve_streaming.py
-# Correlated Value Encoding (CVE) - memory-efficient implementation.
-# - CVE term: negative absolute Pearson correlation between model parameters and a secret vector.
-# - Streaming accumulation: no full parameter flattening, no large secret tiling.
-# - Forward returns ONLY the CVE term. You add it to your task loss externally.
+# Memory-efficient Correlated Value Encoding (CVE) with robust wrapping & chunking.
+# - Forward returns ONLY the CVE term; add it to your task loss externally.
+# - Handles arbitrarily large param tensors by processing in chunks.
 #
-# Usage (sketch):
-#   cve = StreamingCVE(model, dataset=train_subset, lambda_c=1.0, base_secret_len=100*28*28, device=device)
+# Example:
+#   cve = StreamingCVE(model, dataset=train_subset, base_secret_len=100*28*28, device=device)
 #   ...
-#   logits = model(x); task_loss = criterion(logits, y)
-#   cve_term = cve()                 # or cve.forward()
-#   total_loss = task_loss + 1.0 * cve_term
+#   task_loss = criterion(logits, y)
+#   cve_term = cve()                    # just the CVE term
+#   total_loss = task_loss + lambda_c * cve_term
 #   total_loss.backward()
-#
-# Reconstruction (streaming):
-#   recon = reconstruct_streaming(model, total_values=K*28*28, item_shape=(1,28,28))
-#
-# Author: (you)
 
 from __future__ import annotations
 from typing import Callable, Iterable, Optional, Tuple
 
+import math
 import torch
 import torch.nn as nn
 
@@ -37,13 +32,10 @@ def build_base_secret(
     """
     Build a compact 'base' secret vector s_base of length <= max_values from a dataset.
 
-    - Iterates the dataset once (or until collected >= max_values).
+    - Iterates the dataset until collected >= max_values (or dataset ends).
     - value_extractor(item) -> 1D float tensor; default flattens first element if (x, y).
     - Zero-mean + L2-normalize for stable correlation.
     - Stored in low precision (fp16 by default) to save memory.
-
-    Returns:
-        s_base (1D tensor), length in [1, max_values]
     """
     vals = []
     if value_extractor is None:
@@ -67,59 +59,60 @@ def build_base_secret(
         raise ValueError("build_base_secret: dataset yielded no numeric content.")
 
     s_base = torch.cat(vals, dim=0)[:max_values]
-    # Normalize (zero mean, L2 norm = 1) for stable Pearson correlation
     s_base = s_base - s_base.mean()
     s_base = s_base / (torch.sqrt((s_base ** 2).sum()) + 1e-12)
     s_base = s_base.to(dtype=dtype)
     return s_base
 
 
-def _wrap_slice(base: torch.Tensor, start: int, length: int) -> torch.Tensor:
+def _wrap_fill_chunked(base: torch.Tensor, start: int, length: int) -> torch.Tensor:
     """
-    Circularly slice a 1D tensor 'base': take 'length' values starting at 'start'.
-    Returns a view/concat (at most one concat when wrapping occurs).
+    Return a 1D tensor of 'length' by circularly sampling from 'base' starting at 'start'.
+    Handles arbitrary 'length' (may wrap many times). At most one concat per call.
     """
     m = base.numel()
     if m == 0:
-        raise ValueError("wrap_slice: empty base tensor.")
+        raise ValueError("_wrap_fill_chunked: empty base tensor.")
     s = start % m
-    if s + length <= m:
+    if length <= m - s:
         return base.narrow(0, s, length)
-    # wrap once
-    first = base.narrow(0, s, m - s)
-    second = base.narrow(0, 0, length - (m - s))
-    return torch.cat([first, second], dim=0)
+    # Need more than the tail: produce (tail + full repeats + head)
+    tail_len = m - s
+    rem = length - tail_len
+    full_reps = rem // m
+    head_len = rem % m
+    # Efficient assembly: [tail] + [full repeats if any] + [head if any]
+    parts = [base.narrow(0, s, tail_len)]
+    if full_reps > 0:
+        parts.append(base.repeat(full_reps))
+    if head_len > 0:
+        parts.append(base.narrow(0, 0, head_len))
+    return torch.cat(parts, dim=0)
 
 
 # ------------------------------- CVE loss module ------------------------------- #
 
 class StreamingCVE(nn.Module):
     """
-    Memory-lean Correlated Value Encoding (CVE) loss term:
+    Memory-lean Correlated Value Encoding (CVE) term:
+        cve_term = -|corr(theta, s)|
 
-        cve_term = -|corr(theta, s)|,
+    - theta is streamed across participating parameters (no global flatten).
+    - s is provided by circularly wrapping a small base secret (s_base).
+    - Computation is done in CHUNKS to cap peak memory.
 
-    where:
-      - theta is the concatenation of trainable model parameters (streamed; not materialized).
-      - s is a circular 'secret' vector, implemented by wrapping a small base secret s_base.
-
-    Key properties:
-      - Forward returns ONLY the CVE term (scalar tensor). You add it to your task loss externally.
-      - Two-pass accumulation for the Pearson components (mean first, then covariance & norms).
-      - Supports optional parameter filtering to limit which params participate.
+    forward(...) returns ONLY the CVE term (scalar). Add it to your task loss externally.
 
     Args:
       model: nn.Module
       dataset: PyTorch dataset used to derive s_base
-      lambda_c: is NOT applied inside forward (you add it yourself); kept here for reference/logging
-      base_secret_len: max length of s_base (small; e.g., 50k..200k). Larger can help fidelity.
-      value_extractor: optional callable to turn dataset item -> 1D float tensor
-      device: device for s_base (params follow model devices)
-      parameter_filter: optional predicate (Tensor -> bool) deciding whether a param participates
-
-    Example:
-      cve = StreamingCVE(model, dataset, base_secret_len=100*28*28, device=device)
-      cve_term = cve()  # add to task loss externally
+      lambda_c: NOT applied inside forward; for your external weighting
+      base_secret_len: length of s_base (e.g., 50k..200k). Larger can improve fidelity.
+      value_extractor: callable mapping dataset item -> 1D float tensor
+      device: device for s_base buffer
+      parameter_filter: predicate (nn.Parameter -> bool) to select participating params
+      secret_dtype: dtype for s_base
+      chunk_len: maximum scalars to process per chunk (controls memory use)
     """
 
     def __init__(
@@ -132,11 +125,13 @@ class StreamingCVE(nn.Module):
         device: Optional[torch.device | str] = None,
         parameter_filter: Optional[Callable[[nn.Parameter], bool]] = None,
         secret_dtype: torch.dtype = torch.float16,
+        chunk_len: int = 1_000_000,
     ):
         super().__init__()
         self.model = model
-        self.lambda_c = float(lambda_c)  # not applied internally; kept for reference
+        self.lambda_c = float(lambda_c)  # not used internally
         self.parameter_filter = parameter_filter
+        self.chunk_len = int(chunk_len)
 
         s_base = build_base_secret(
             dataset=dataset,
@@ -145,7 +140,6 @@ class StreamingCVE(nn.Module):
             device=device,
             dtype=secret_dtype,
         )
-        # Register as a buffer (non-persistent by default to keep checkpoints lighter)
         self.register_buffer("s_base", s_base, persistent=False)
 
     def _param_iter(self) -> Iterable[torch.Tensor]:
@@ -159,41 +153,48 @@ class StreamingCVE(nn.Module):
 
     def forward(self, eps: float = 1e-12) -> torch.Tensor:
         """
-        Compute and return ONLY the CVE term (a scalar tensor):
+        Compute and return ONLY the CVE term (scalar):
             cve_term = -|corr(theta, s)|
-
-        You add it to your task loss externally:
-            total = task_loss + lambda_c * cve_term
         """
-        # ------------ Pass 1: compute mean(theta) ------------
+        # ---------------- Pass 1: mean(theta) ----------------
         N = 0
         sum_theta = 0.0
         for v in self._param_iter():
             sum_theta = sum_theta + v.sum()  # differentiable
             N += v.numel()
         if N == 0:
-            # No participating params -> return 0 to avoid NaNs
+            # No participating params -> return 0
             return torch.zeros((), dtype=self.s_base.dtype, device=self.s_base.device, requires_grad=True)
         mean_theta = sum_theta / N
 
-        # ------------ Pass 2: Pearson accumulators ------------
-        num = 0.0       # sum((theta-mean)*s)
-        sum_th2 = 0.0   # sum((theta-mean)^2)
-        sum_s2 = 0.0    # sum(s^2) for exactly-used slices
+        # ------------- Pass 2: Pearson accumulators ----------
+        num = 0.0      # sum((theta-mean)*s)
+        sum_th2 = 0.0  # sum((theta-mean)^2)
+        sum_s2 = 0.0   # sum(s^2) for exactly-used elements
 
-        idx = 0
+        idx = 0  # global index along theta
+        m = self.s_base.numel()
+
         for v in self._param_iter():
             L = v.numel()
-            s_slice = _wrap_slice(self.s_base, idx, L).to(v.dtype)  # match dtype (fp16/fp32/bf16)
-            th_c = v - mean_theta
-            num = num + (th_c * s_slice).sum()
-            sum_th2 = sum_th2 + (th_c * th_c).sum()
-            sum_s2 = sum_s2 + (s_slice * s_slice).sum()
+            pos = 0
+            while pos < L:
+                clen = min(self.chunk_len, L - pos)
+                # Secret chunk (wrap-aware)
+                s_chunk = _wrap_fill_chunked(self.s_base, idx + pos, clen).to(v.dtype)
+                # Parameter chunk
+                th_chunk = v.narrow(0, pos, clen) - mean_theta
+
+                num = num + (th_chunk * s_chunk).sum()
+                sum_th2 = sum_th2 + (th_chunk * th_chunk).sum()
+                sum_s2 = sum_s2 + (s_chunk * s_chunk).sum()
+
+                pos += clen
             idx += L
 
         corr = (num.abs()) / (torch.sqrt(sum_th2 + eps) * torch.sqrt(sum_s2 + eps))
         cve_term = -corr
-        return cve_term  # scalar tensor
+        return cve_term
 
 
 # ------------------------------- Reconstruction ------------------------------- #
@@ -211,24 +212,10 @@ def reconstruct_streaming(
     Streaming reconstruction of the first `total_values` parameter entries, mapped back
     to a numeric range and reshaped to (N, *item_shape).
 
-    This mirrors the simple linear min-max projection used in many numeric CVE demos:
-      - collect a leading segment of params (without flattening all of them),
-      - min-max map to value_range,
-      - optionally also try the negated segment (-seg) and return the higher-contrast one,
-      - reshape to batches of item_shape.
-
-    Args:
-      model: trained model
-      total_values: how many values to extract from the leading parameters
-      item_shape: per-item shape (e.g., (1,28,28) for MNIST grayscale)
-      value_range: numeric range to project into (e.g., (0,255) or (0,1))
-      parameter_filter: optional predicate to restrict which params we read
-      invert_contrast: try both seg and -seg, return higher-std projection
-
-    Returns:
-      recon: tensor of shape (N, *item_shape)
+    - Gathers only what's needed; no full flatten of parameters.
+    - Min–max projection into value_range.
+    - Optionally tries negated segment and returns the higher-contrast projection.
     """
-    # Gather just enough values
     remaining = total_values
     buf = []
     for p in model.parameters():
@@ -243,7 +230,6 @@ def reconstruct_streaming(
 
     if not buf:
         raise ValueError("reconstruct_streaming: no parameters available.")
-
     seg = torch.cat(buf, dim=0)
 
     def minmax_project(vec: torch.Tensor) -> torch.Tensor:
