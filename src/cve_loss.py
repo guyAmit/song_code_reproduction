@@ -4,59 +4,70 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 @torch.no_grad()
-def _flatten_model_params(model: nn.Module, device=None) -> torch.Tensor:
-    """Concatenate all (requires_grad) parameters into one 1-D tensor."""
-    parts = []
-    for p in model.parameters():
-        if p.requires_grad:
-            parts.append(p.detach().reshape(-1))
-    flat = torch.cat(parts, dim=0)
-    if device is not None:
-        flat = flat.to(device)
-    return flat
-
-@torch.no_grad()
 def build_secret_vector_from_dataset(
     dataset,
     target_len: int,
     value_extractor=None,
     device=None,
+    pad_strategy: str = "tile",   # "tile" | "zeros"
 ):
     """
-    Create a numeric 'secret' vector s ∈ R^{target_len} from a PyTorch dataset.
-    Default: take raw numeric tensors (e.g., images), flatten, and concatenate
-    in dataset order until we reach target_len, then truncate.
-    value_extractor(x) -> 1D float tensor allows custom extraction (e.g., grayscale).
+    Build s with length == target_len.
+    - Collect numeric values from dataset (flattened) until we run out.
+    - If we still have < target_len, pad according to `pad_strategy` (default: tile).
     """
     vals = []
     if value_extractor is None:
         def value_extractor(x):
-            # Accept (x, y) or x
             x = x[0] if isinstance(x, (tuple, list)) else x
-            # Ensure float32
             if not torch.is_floating_point(x):
                 x = x.float()
             return x.reshape(-1)
 
-    # Stream without loading entire dataset into RAM
+    collected = 0
     for item in dataset:
         v = value_extractor(item)
         vals.append(v)
-        total = sum(len(t) for t in vals)
-        if total >= target_len:
+        collected += v.numel()
+        if collected >= target_len:
             break
 
     if not vals:
         raise ValueError("Dataset produced no numeric content for secret vector.")
 
-    s = torch.cat(vals, dim=0)[:target_len]
-    # Normalize to stabilize correlation (zero-mean, unit-scale-like)
+    s = torch.cat(vals, dim=0)
+    if s.numel() < target_len:
+        if pad_strategy == "tile":
+            # Repeat the available values to fill up to target_len
+            reps = (target_len + s.numel() - 1) // s.numel()
+            s = s.repeat(reps)[:target_len]
+        elif pad_strategy == "zeros":
+            pad = torch.zeros(target_len - s.numel(), dtype=s.dtype, device=s.device)
+            s = torch.cat([s, pad], dim=0)
+        else:
+            raise ValueError(f"Unknown pad_strategy: {pad_strategy}")
+    else:
+        s = s[:target_len]
+
+    # Normalize for stable correlation
     s = s - s.mean()
-    denom = torch.sqrt((s**2).sum() + 1e-12)
-    s = s / denom
+    s = s / (torch.sqrt((s**2).sum()) + 1e-12)
+
     if device is not None:
         s = s.to(device)
     return s
+
+def _flatten_model_params(model: nn.Module, device=None, take_first: int | None = None):
+    parts = []
+    for p in model.parameters():
+        if p.requires_grad:
+            parts.append(p.detach().reshape(-1))
+    flat = torch.cat(parts, dim=0)
+    if take_first is not None:
+        flat = flat[:take_first]
+    if device is not None:
+        flat = flat.to(device)
+    return flat
 
 def pearson_neg_abs_corr(theta: torch.Tensor, s: torch.Tensor, eps: float = 1e-12):
     """
@@ -75,40 +86,73 @@ def pearson_neg_abs_corr(theta: torch.Tensor, s: torch.Tensor, eps: float = 1e-1
 
 class CorrelatedValueEncodingLoss(nn.Module):
     """
-    Wraps a base task criterion and adds the malicious CVE term:
-        total_loss = task_loss + (lambda_c) * C(theta, s),
-    where C(theta, s) = -|corr(theta, s)|.
-    The secret vector s is constructed from a provided dataset.
+    total_loss = task_loss + lambda_c * C(theta_matched, s_matched)
+    match='tile_secret': tile s to len(theta)   (default; uses all params)
+    match='slice_params': slice theta to len(s) (use subset of params)
     """
-    def __init__(self, model: nn.Module, dataset, lambda_c: float = 1.0,
-                 value_extractor=None, device=None):
+    def __init__(self, model: nn.Module, dataset,
+                 lambda_c: float = 1.0,
+                 value_extractor=None,
+                 device=None,
+                 match: str = "tile_secret"):  # "tile_secret" | "slice_params"
         super().__init__()
         self.model = model
         self.lambda_c = float(lambda_c)
-        # Build s to match number of params in model (that require grad)
+        self.match = match
+
         with torch.no_grad():
             theta0 = _flatten_model_params(model, device=device)
-        self.register_buffer(
-            "s",
-            build_secret_vector_from_dataset(
+
+        if self.match == "tile_secret":
+            target_len = theta0.numel()
+        elif self.match == "slice_params":
+            # Use exactly as many params as 1 pass through dataset provides
+            # (e.g., K images). If you want a fixed K, pass a custom dataset wrapper.
+            target_len = None  # build raw (no need to equal theta here)
+        else:
+            raise ValueError(f"Unknown match option: {self.match}")
+
+        # Build secret. If tiling, force to full param length.
+        if self.match == "tile_secret":
+            s = build_secret_vector_from_dataset(
                 dataset=dataset,
                 target_len=theta0.numel(),
                 value_extractor=value_extractor,
                 device=device,
-            ),
-            persistent=False,
-        )
+                pad_strategy="tile",
+            )
+        else:
+            # Build a single-pass secret (no padding); length = collected dataset values
+            s = build_secret_vector_from_dataset(
+                dataset=dataset,
+                target_len=10**12,  # effectively "max", we'll trim later
+                value_extractor=value_extractor,
+                device=device,
+                pad_strategy="tile",  # harmless; we'll slice by theta later
+            )
 
-    def forward(self,):
-        # NOTE: We re-flatten current parameters on-the-fly to track training progress.
-        theta = []
-        for p in self.model.parameters():
-            if p.requires_grad:
-                theta.append(p.reshape(-1))
-        theta = torch.cat(theta, dim=0)
+        self.register_buffer("s", s, persistent=False)
 
-        c_term = pearson_neg_abs_corr(theta, self.s)
-        return self.lambda_c * c_term, c_term.detach()
+    def forward(self, task_loss: torch.Tensor):
+        theta_parts = [p.reshape(-1) for p in self.model.parameters() if p.requires_grad]
+        theta = torch.cat(theta_parts, dim=0)
+
+        if self.match == "tile_secret":
+            # s was already built to len(theta)
+            s = self.s
+        else:  # "slice_params"
+            # Match by slicing theta to len(s)
+            if self.s.numel() > theta.numel():
+                # In case model is tiny, slice s instead
+                s = self.s[:theta.numel()]
+                th = theta
+            else:
+                s = self.s
+                th = theta[:s.numel()]
+            return task_loss + self.lambda_c * pearson_neg_abs_corr(th, s), pearson_neg_abs_corr(th, s).detach()
+
+        c_term = pearson_neg_abs_corr(theta, s)
+        return task_loss + self.lambda_c * c_term, c_term.detach()
 
 # ---------- Simple numeric reconstruction (e.g., images) ----------
 
