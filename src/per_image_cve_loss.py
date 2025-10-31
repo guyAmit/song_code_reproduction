@@ -63,6 +63,64 @@ def blockwise_cve_term(
         losses.append(-(num / (den + eps)))
     return torch.stack(losses).mean()
 
+@torch.no_grad()
+def reconstruct_block_k(
+    model,
+    k: int,
+    block_len: int,
+    item_shape=(1,28,28),
+    value_range=(0.,1.),
+    invert_contrast=True,
+    parameter_filter=None,
+):
+    """
+    Reads only the k-th block (0-based). Avoids materializing all K blocks.
+    """
+    start = k * block_len
+    end = start + block_len
+
+    # Seek to [start:end) within the participating parameters
+    taken, buf = 0, []
+    for p in model.parameters():
+        if parameter_filter is not None and not parameter_filter(p):
+            continue
+        flat = p.detach().reshape(-1).to("cpu")
+        next_taken = taken + flat.numel()
+        # overlap with [start, end)?
+        if next_taken > start:
+            s = max(0, start - taken)
+            e = min(flat.numel(), end - taken)
+            if e > s:
+                buf.append(flat[s:e])
+        taken = next_taken
+        if taken >= end:
+            break
+
+    if not buf:
+        raise ValueError("Block index out of range or no participating parameters.")
+    b = torch.cat(buf, dim=0)
+    if b.numel() != block_len:
+        raise RuntimeError("Collected block length mismatch; check block_len and filter.")
+
+    # min–max (and optional inversion)
+    vmin, vmax = b.min(), b.max()
+    if (vmax - vmin).abs() < 1e-12:
+        proj = torch.full_like(b, 0.5*(value_range[0]+value_range[1]))
+    else:
+        proj = (b - vmin) / (vmax - vmin)
+        proj = proj * (value_range[1]-value_range[0]) + value_range[0]
+    if invert_contrast:
+        b_inv = -b
+        vmin, vmax = b_inv.min(), b_inv.max()
+        proj_inv = torch.full_like(b_inv, 0.5*(value_range[0]+value_range[1])) if (vmax - vmin).abs() < 1e-12 \
+                   else (b_inv - vmin) / (vmax - vmin) * (value_range[1]-value_range[0]) + value_range[0]
+        if proj_inv.std() > proj.std():
+            proj = proj_inv
+
+    return proj.view(*item_shape)
+
+
+
 # Setup once
 # K = 100
 # block_len = 28*28
@@ -75,3 +133,11 @@ def blockwise_cve_term(
 # loss = task_loss + lambda_c * cve_term
 # loss.backward()
 # optimizer.step()
+
+# rec_images = []
+# for i in range(100):
+#     img_i = reconstruct_block_k(model, k=i,
+#                                 block_len=28*28,
+#                                 item_shape=(1,28,28),
+#                                 value_range=(0.,1.))
+#     rec_images.append(img_i)
