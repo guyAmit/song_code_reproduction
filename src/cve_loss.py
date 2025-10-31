@@ -133,7 +133,7 @@ class CorrelatedValueEncodingLoss(nn.Module):
 
         self.register_buffer("s", s, persistent=False)
 
-    def forward(self, task_loss: torch.Tensor):
+    def forward(self):
         theta_parts = [p.reshape(-1) for p in self.model.parameters() if p.requires_grad]
         theta = torch.cat(theta_parts, dim=0)
 
@@ -149,10 +149,10 @@ class CorrelatedValueEncodingLoss(nn.Module):
             else:
                 s = self.s
                 th = theta[:s.numel()]
-            return task_loss + self.lambda_c * pearson_neg_abs_corr(th, s), pearson_neg_abs_corr(th, s).detach()
+            return self.lambda_c * pearson_neg_abs_corr(th, s), pearson_neg_abs_corr(th, s).detach()
 
         c_term = pearson_neg_abs_corr(theta, s)
-        return task_loss + self.lambda_c * c_term, c_term.detach()
+        return self.lambda_c * c_term, c_term.detach()
 
 # ---------- Simple numeric reconstruction (e.g., images) ----------
 
