@@ -119,23 +119,34 @@ def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes) -> int:
     """
     remaining = len(secret)
     offset = 0
-    device = next(model.parameters()).device if any(True for _ in model.parameters()) else torch.device("cpu")
+
+    # pick device safely even if model has no params yet
+    params = list(model.parameters())
+    device = params[0].device if params else torch.device("cpu")
+
     with torch.no_grad():
         for p, arr in _iter_model_param_arrays(model):
             if remaining <= 0:
                 break
-            # Reinterpret underlying float32 array as bytes
-            bytes_view = arr.view(np.uint8)  # 4 bytes per float32
-            # Indices of the last byte of each float (little-endian -> index 3 of each 4)
+
+            # Flat byte-level view (1-D) over the contiguous float32 array
+            bytes_view = arr.view(np.uint8).ravel()  # <-- make it flat!
+
+            # indices of the last byte of each float32 (LE: 3, 7, 11, ...)
             last_byte_indices = np.arange(3, bytes_view.size, 4, dtype=np.int64)
+
             n_write = min(remaining, last_byte_indices.size)
             if n_write > 0:
-                bytes_view[last_byte_indices[:n_write]] = np.frombuffer(secret[offset:offset + n_write], dtype=np.uint8)
+                bytes_view[last_byte_indices[:n_write]] = np.frombuffer(
+                    secret[offset:offset + n_write], dtype=np.uint8
+                )
                 offset += n_write
                 remaining -= n_write
-            # Write back to the original parameter (preserving shape)
+
+            # copy back to the parameter (arr already mutated in-place)
             new_tensor = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
             p.data.copy_(new_tensor.view_as(p))
+
     return offset
 
 
@@ -147,12 +158,13 @@ def extract_bytes_from_model_last_byte(model: nn.Module, n_bytes: int) -> bytes:
     for p, arr in _iter_model_param_arrays(model):
         if len(out) >= n_bytes:
             break
-        bytes_view = arr.view(np.uint8)
+        bytes_view = arr.view(np.uint8).ravel()  # <-- flat 1-D
         last_byte_indices = np.arange(3, bytes_view.size, 4, dtype=np.int64)
         need = n_bytes - len(out)
         take = min(need, last_byte_indices.size)
         if take > 0:
             out.extend(bytes_view[last_byte_indices[:take]].tolist())
+
     if len(out) < n_bytes:
         raise ValueError(f"Model holds only {len(out)} / {n_bytes} requested bytes")
     return bytes(out)
