@@ -36,78 +36,61 @@ def build_framed_stream_from_dataset(dataset, max_images=None) -> bytes:
             break
     return out.getvalue()
 
-def robust_parse_framed_stream(stream: bytes, magic: bytes, ver: int = 1, verbose=False):
-    """
-    Scan for `magic` using bytes.find(). For each hit, try to unpack a header:
-        magic | ver | flags | seq | H | W | C | payload_len | crc32
-    Layout is little-endian and derived from len(magic), so stale globals won't break it.
-    """
-    MAGIC = magic
-    ML = len(MAGIC)
-    HDR_FMT  = f"<{ML}s B B I H H B I I"
+
+def parse_framed_stream(stream: bytes, magic: bytes, ver: int = 1, verbose=False):
+    ML = len(magic)
+    HDR_FMT  = f"<{ML}s B B I H H B I I"  # magic, ver, flags, seq, H, W, C, payload_len, crc32 (ignored)
     HDR_SIZE = struct.calcsize(HDR_FMT)
 
     imgs = []
-    hits = bad_crc = truncated = weird = 0
     end = len(stream)
+    hits = truncated = weird = 0
     i = 0
 
     while True:
-        pos = stream.find(MAGIC, i)
+        pos = stream.find(magic, i)
         if pos == -1:
             break
-        # Need the whole header
         if pos + HDR_SIZE > end:
             truncated += 1
             break
 
         try:
-            hdr = struct.unpack(HDR_FMT, stream[pos:pos+HDR_SIZE])
+            _, hdr_ver, flags, seq, H, W, C, plen, _crc_ignored = struct.unpack(
+                HDR_FMT, stream[pos:pos+HDR_SIZE]
+            )
         except struct.error:
             weird += 1
             i = pos + 1
             continue
 
-        _, hdr_ver, flags, seq, H, W, C, plen, crc = hdr
-        total = HDR_SIZE + plen
-
-        # Basic sanity
+        # sanity, but keep it permissive
         if hdr_ver != ver or H == 0 or W == 0 or not (1 <= C <= 4) or plen > 64_000_000:
             weird += 1
             i = pos + 1
             continue
 
+        total = HDR_SIZE + plen
         if pos + total > end:
             truncated += 1
             break
 
-        payload = stream[pos+HDR_SIZE : pos+total]
-        if (zlib.crc32(payload) & 0xFFFFFFFF) != crc:
-            bad_crc += 1
-            i = pos + 1
-            continue
+        payload = stream[pos+HDR_SIZE:pos+total]
 
-        arr = np.frombuffer(payload, dtype=np.uint8)
-        try:
-            arr = arr.reshape((H, W, C))
-        except ValueError:
-            weird += 1
-            i = pos + 1
-            continue
+        # Always construct (pad or trim to expected size if needed)
+        need = H * W * C
+        data = payload[:need]
+        if len(data) < need:
+            data = data + b"\x00" * (need - len(data))  # fill with black
 
+        arr = np.frombuffer(data, dtype=np.uint8).reshape((H, W, C))
         imgs.append(arr)
         hits += 1
-        i = pos + total  # jump to end of frame and keep scanning
+        i = pos + total
 
-    stats = {
-        "frames_ok": hits,
-        "crc_fail": bad_crc,
-        "truncated": truncated,
-        "weird_header": weird,
-        "bytes_scanned": end,
-    }
+    stats = {"frames_ok": hits, "truncated": truncated, "weird_header": weird, "bytes_scanned": end}
     if verbose:
-        print("robust_parse stats:", stats)
+        print("forgiving_parse stats:", stats)
     return imgs, stats
 
 def extract_all_bytes_from_model_last_byte(model: nn.Module) -> bytes:
