@@ -11,44 +11,11 @@ import numpy as np
 # 1) Secret extraction helpers
 # ----------------------------
 
-def dataset_to_bytes(dataset: torch.utils.data.Dataset,
-                     max_bytes: Optional[int] = None) -> bytes:
-    """
-    Extract raw-ish bytes from the dataset quickly.
-    Assumes dataset[i] returns (x, y) and x is a tensor/ndarray-like.
-    We just flatten 'x' and dump its uint8 representation.
-    """
+def dataset_to_bytes(raw_dataset):
     chunks = []
-    total = 0
-    i = 0
-    while max_bytes is None or total < max_bytes:
-        if i >= len(dataset):
-            break
-        x, _ = dataset[i]
-        i += 1
-        # Convert to uint8 bytes conservatively
-        if isinstance(x, torch.Tensor):
-            arr = x.detach().cpu()
-            # If float, map to [0,255] and cast to uint8
-            if arr.dtype.is_floating_point:
-                arr = (arr.clamp(0, 1) * 255.0).round().to(torch.uint8)
-            else:
-                arr = arr.to(torch.uint8)
-            buf = arr.contiguous().numpy().tobytes()
-        else:
-            arr = np.asarray(x)
-            if arr.dtype.kind == 'f':
-                arr = (np.clip(arr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-            else:
-                arr = arr.astype(np.uint8, copy=False)
-            buf = arr.tobytes()
-
-        # trim if needed
-        if max_bytes is not None and total + len(buf) > max_bytes:
-            need = max_bytes - total
-            buf = buf[:need]
-        chunks.append(buf)
-        total += len(buf)
+    for i in range(len(raw_dataset)):
+        image, _ = raw_dataset[i]
+        chunks.append(image.numpy().tobytes())  # 28*28=784 bytes per image
     return b"".join(chunks)
 
 def bytes_to_bits(b: bytes) -> torch.Tensor:
@@ -85,7 +52,7 @@ def extract_secret_signs_from_dataset(dataset,
     g = torch.Generator().manual_seed(seed)
     # Aim to gather at least num_params bits (num_params/8 bytes)
     need_bytes = math.ceil(num_params / 8)
-    raw = dataset_to_bytes(dataset, max_bytes=need_bytes)
+    raw = dataset_to_bytes(dataset)
     bits = bytes_to_bits(raw)
     s = bits_to_signs(bits, L=num_params)  # int8 {-1,+1}
     return s
