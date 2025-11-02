@@ -2,6 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+def model_capacity_last_byte(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
 def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes, from_end: bool = False) -> int:
     """
     Write `secret` into the last byte of each float32 parameter.
