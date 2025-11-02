@@ -161,3 +161,33 @@ def reconstruct_bytes_from_model(model: nn.Module, num_bits: Optional[int] = Non
     arr = bits.numpy().astype(np.uint8)
     packed = np.packbits(arr)
     return packed.tobytes()
+
+def bytes_to_images_numpy(blob: bytes, n: int, h: int, w: int, c: int = 1, order: str = "CHW"):
+    """
+    Convert the reconstructed bytes to a NumPy array of images.
+    order="CHW" -> shape (n, c, h, w)
+    order="HWC" -> shape (n, h, w, c)
+    """
+    needed = n * h * w * c
+    arr = np.frombuffer(blob, dtype=np.uint8)
+
+    if arr.size < needed:
+        raise ValueError(f"Not enough bytes: need {needed}, got {arr.size}.")
+    # If there is padding/extra data (likely due to bit padding), drop it:
+    arr = arr[:needed]
+
+    if order.upper() == "CHW":
+        return arr.reshape(n, c, h, w)
+    elif order.upper() == "HWC":
+        return arr.reshape(n, h, w, c)
+    else:
+        raise ValueError("order must be 'CHW' or 'HWC'")
+
+def bytes_to_images_torch(blob: bytes, n: int, h: int, w: int, c: int = 1, order: str = "CHW", device: str = "cpu"):
+    """
+    Same as above, but returns a torch.uint8 tensor.
+    """
+    # go via NumPy for broad compatibility
+    np_imgs = bytes_to_images_numpy(blob, n, h, w, c=c, order=order)
+    t = torch.from_numpy(np_imgs).to(device)
+    return t
