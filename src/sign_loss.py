@@ -151,5 +151,5 @@ def bytes_to_images_torch(blob: bytes, n: int, h: int, w: int, c: int = 1, order
     """
     # go via NumPy for broad compatibility
     np_imgs = bytes_to_images_numpy(blob, n, h, w, c=c, order=order)
-    t = torch.from_numpy(np_imgs).to(device)
+    t = torch.tensor(np_imgs, device=device)
     return t
