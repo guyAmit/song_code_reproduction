@@ -42,16 +42,12 @@ def bits_to_signs(bits: torch.Tensor, L: int) -> torch.Tensor:
     return s
 
 def extract_secret_signs_from_dataset(dataset,
-                                      num_params: int,
-                                      seed: int = 0) -> torch.Tensor:
+                                      num_params: int) -> torch.Tensor:
     """
     Build the secret sign vector s in {-1,+1}^L from dataset bytes.
     Per the paper, encode raw data bits rather than compressed data,
     since sign constraints may not be perfectly satisfied.  :contentReference[oaicite:4]{index=4}
     """
-    g = torch.Generator().manual_seed(seed)
-    # Aim to gather at least num_params bits (num_params/8 bytes)
-    need_bytes = math.ceil(num_params / 8)
     raw = dataset_to_bytes(dataset)
     bits = bytes_to_bits(raw)
     s = bits_to_signs(bits, L=num_params)  # int8 {-1,+1}
@@ -71,15 +67,14 @@ class SignEncodingCriterion(nn.Module):
                  dataset: torch.utils.data.Dataset,
                  model: nn.Module,
                  lambda_s: float = 10.0,
-                 device: Optional[torch.device] = None,
-                 seed: int = 0):
+                 device: Optional[torch.device] = None):
         super().__init__()
         self.device = device
         # Build s from dataset and cache as a buffer so it moves with the module
         with torch.no_grad():
             theta = parameters_to_vector(model.parameters())
             L = theta.numel()
-        s = extract_secret_signs_from_dataset(dataset, L, seed=seed).to(torch.int8)
+        s = extract_secret_signs_from_dataset(dataset, L).to(torch.int8)
         if device is not None:
             s = s.to(device)
         # register s and lambda_s as buffers (not parameters)
