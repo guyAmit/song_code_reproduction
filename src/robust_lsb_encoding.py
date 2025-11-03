@@ -80,7 +80,31 @@ def extract_all_bytes_from_model_last_byte(model: nn.Module) -> bytes:
             out.extend(flat[idx].tolist())
     return bytes(out)
 
+# --------------------------
+# Payload building / parsing - for mri data
+# --------------------------
+def build_tail_payload_from_mri_data(dataset, max_images=None):
+    """
+    mem_dataset[i] returns (image_tensor: CxHxW float32 in [0,1], mask_tensor)
+    We convert to uint8 HxWxC and concatenate bytes.
+    Returns: (payload_bytes, metas[(H,W,C,L), ...])
+    """
+    payload_parts = []
+    metas = []
+    N = len(dataset) if max_images is None else min(max_images, len(dataset))
+    for i in range(N):
+        img_t, _ = dataset[i]             # CxHxW, float32 [0,1]
+        # clamp->uint8 HxWxC
+        arr = (img_t.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
+        H, W, C = arr.shape
+        b = arr.tobytes()
+        payload_parts.append(b)
+        metas.append((H, W, C, len(b)))
+    return b"".join(payload_parts), metas
 
+# --------------------------
+# Payload building / parsing - for mnist / cifar data
+# --------------------------
 def build_tail_payload_from_dataset(dataset, max_images=None):
     import numpy as np
     payload_parts = []
