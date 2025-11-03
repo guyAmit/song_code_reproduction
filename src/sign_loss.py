@@ -15,7 +15,7 @@ def dataset_to_bytes(raw_dataset):
     chunks = []
     for i in range(len(raw_dataset)):
         image, _ = raw_dataset[i]
-        chunks.append(image.numpy().tobytes())  # 28*28=784 bytes per image
+        chunks.append(image.tobytes())  # 28*28=784 bytes per image
     return b"".join(chunks)
 
 def bytes_to_bits(b: bytes) -> torch.Tensor:
