@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SoftTargetCrossEntropy(nn.Module):
+    """Cross-entropy that expects probability targets (one-hot or mixed)."""
+    def forward(self, logits, target_probs):
+        log_probs = F.log_softmax(logits, dim=-1)
+        return -(target_probs * log_probs).sum(dim=-1).mean()
 
 # Loss for ViT on CIFAR-100 with label smoothing
 class LabelSmoothingCrossEntropyLoss(nn.Module):

@@ -57,49 +57,89 @@ class RandomCropPaste(object):
         return bbx1, bby1, bbx2, bby2
 
 
-class CutMix(object):
-    def __init__(self, size, beta):
-        self.size = size
-        self.beta = beta
+def one_hot(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """(B,) -> (B, C) one-hot on same device/dtype=float32."""
+    y = torch.zeros((labels.size(0), num_classes), device=labels.device, dtype=torch.float32)
+    y.scatter_(1, labels.view(-1, 1), 1.0)
+    return y
 
-    def __call__(self, batch):
-        img, label = batch
-        rand_img, rand_label = self._shuffle_minibatch(batch)
-        lambda_ = np.random.beta(self.beta, self.beta)
-        r_x = np.random.uniform(0, self.size)
-        r_y = np.random.uniform(0, self.size)
-        r_w = self.size * np.sqrt(1-lambda_)
-        r_h = self.size * np.sqrt(1-lambda_)
-        x1 = int(np.clip(r_x - r_w // 2, a_min=0, a_max=self.size))
-        x2 = int(np.clip(r_x + r_w // 2, a_min=0, a_max=self.size))
-        y1 = int(np.clip(r_y - r_h // 2, a_min=0, a_max=self.size))
-        y2 = int(np.clip(r_y + r_h // 2, a_min=0, a_max=self.size))
-        img[:, :, x1:x2, y1:y2] = rand_img[:, :, x1:x2, y1:y2]
-        
-        lambda_ = 1 - (x2-x1)*(y2-y1)/(self.size*self.size)
-        return img, label, rand_label, lambda_
+def _rand_bbox(W: int, H: int, lam: float, device: torch.device):
+    """Compute CutMix bounding box given lambda (area keep ratio)."""
+    cut_w = int(W * (1.0 - lam) ** 0.5)
+    cut_h = int(H * (1.0 - lam) ** 0.5)
 
-    def _shuffle_minibatch(self, batch):
-        img, label = batch
-        rand_img, rand_label = img.clone(), label.clone()
-        rand_idx = torch.randperm(img.size(0))
-        rand_img, rand_label = rand_img[rand_idx], rand_label[rand_idx]
-        return rand_img, rand_label
+    # center
+    cx = torch.randint(0, W, (1,), device=device).item()
+    cy = torch.randint(0, H, (1,), device=device).item()
 
-# Code: https://github.com/facebookresearch/mixup-cifar10
-class MixUp(object):
-    def __init__(self, alpha=0.1):
-        self.alpha = alpha
+    x1 = max(cx - cut_w // 2, 0)
+    x2 = min(cx + cut_w // 2, W)
+    y1 = max(cy - cut_h // 2, 0)
+    y2 = min(cy + cut_h // 2, H)
+    return x1, y1, x2, y2
 
-    def __call__(self, batch):
-        '''Returns mixed inputs, pairs of targets, and lambda'''
-        x, y = batch
-        lam = np.random.beta(self.alpha, self.alpha)
-        batch_size = x.size(0)
-        index = torch.randperm(batch_size)
-        mixed_x = lam * x + (1 - lam) * x[index, :]
-        y_a, y_b = y, y[index]
-        return mixed_x, y_a, y_b, lam
+
+class MixupCutmix:
+    """
+    Batch-level MixUp and CutMix.
+    - With probability p, applies one of {MixUp, CutMix}; otherwise returns originals.
+    - If both alphas > 0, randomly picks which to apply 50/50.
+    """
+    def __init__(self, num_classes: int, mixup_alpha: float = 0.2, cutmix_alpha: float = 1.0, p: float = 1.0):
+        self.num_classes = num_classes
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.p = p
+
+    def _sample_lam(self, alpha: float, device: torch.device) -> float:
+        if alpha <= 0:
+            return 1.0
+        dist = torch.distributions.Beta(alpha, alpha)
+        return float(dist.sample().to(device))
+
+    @torch.no_grad()
+    def __call__(self, x: torch.Tensor, y: torch.Tensor):
+        """
+        x: (B, C, H, W), y: (B,) int64 labels
+        returns: x_mixed, y_probs (B, C)
+        """
+        B, _, H, W = x.shape
+        device = x.device
+
+        # Default: no mix, return hard one-hot (acts like normal CE if you want)
+        y1 = one_hot(y, self.num_classes)
+
+        # maybe apply
+        if torch.rand(1, device=device) > self.p:
+            return x, y1
+
+        # pick partner indices for mixing
+        indices = torch.randperm(B, device=device)
+        y2 = one_hot(y[indices], self.num_classes)
+
+        do_mixup = self.mixup_alpha > 0 and (self.cutmix_alpha <= 0 or torch.rand(1, device=device) < 0.5)
+        do_cutmix = (not do_mixup) and self.cutmix_alpha > 0
+
+        if do_mixup:
+            lam = self._sample_lam(self.mixup_alpha, device)
+            x = lam * x + (1.0 - lam) * x[indices]
+            y = lam * y1 + (1.0 - lam) * y2
+            return x, y
+
+        if do_cutmix:
+            lam = self._sample_lam(self.cutmix_alpha, device)
+            x1, y1b, x2, y2b = _rand_bbox(W, H, lam, device)
+            # paste the patch
+            x[:, :, y1b:y2b, x1:x2] = x[indices, :, y1b:y2b, x1:x2]
+            # adjust lam to the exact area used
+            patch_area = (x2 - x1) * (y2b - y1b)
+            lam_adj = 1.0 - patch_area / float(W * H)
+            y = lam_adj * y1 + (1.0 - lam_adj) * y2
+            return x, y
+
+        # fallback (shouldn’t happen)
+        return x, y1
+
 
 # https://github.com/omihub777/ViT-CIFAR/blob/main/ops.py
 class ShearX(object):

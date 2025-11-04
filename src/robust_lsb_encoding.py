@@ -2,14 +2,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# --- NEW: write/read the mantissa LSB byte (safe) instead of byte 3 (sign+exponent) ---
+BYTE_INDEX = 0  # 0=LSB of mantissa; 3 would corrupt sign/exponent and kill accuracy.
+
 def model_capacity_last_byte(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes, from_end: bool = False) -> int:
     """
-    Write `secret` into the last byte of each float32 parameter.
+    Write `secret` into the chosen byte of each float32 parameter (BYTE_INDEX).
     If from_end=True, the payload is placed at the END of the available byte stream.
-    Returns the number of bytes written (== len(secret) on success).
     """
     remaining = len(secret)
     if remaining == 0:
@@ -18,14 +20,15 @@ def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes, from_end: 
     params = list(model.parameters())
     device = params[0].device if params else torch.device("cpu")
 
-    # First pass: compute per-parameter chunk sizes (# of last-bytes) and total capacity
+    # First pass: compute per-parameter chunk sizes (# of usable bytes) and total capacity
     chunks = []  # (param, arr, flat_bytes, idx)
     total_capacity = 0
     for p in params:
         arr = p.detach().cpu().to(torch.float32).numpy()
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         flat_bytes = arr.view(np.uint8).reshape(-1)
-        idx = np.arange(3, flat_bytes.size, 4, dtype=np.int64)
+        # --- CHANGED: use BYTE_INDEX instead of 3 ---
+        idx = np.arange(BYTE_INDEX, flat_bytes.size, 4, dtype=np.int64)
         chunks.append((p, arr, flat_bytes, idx))
         total_capacity += idx.size
 
@@ -33,24 +36,19 @@ def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes, from_end: 
         raise ValueError(f"Secret ({remaining}) exceeds capacity ({total_capacity}).")
 
     # Determine where to start writing
-    skip = 0
-    if from_end:
-        skip = total_capacity - remaining  # skip this many byte slots, then write the rest
+    skip = (total_capacity - remaining) if from_end else 0
 
     written = 0
     with torch.no_grad():
         for (p, arr, flat_bytes, idx) in chunks:
             n = idx.size
             if n == 0:
-                # still need to write arr back untouched for consistency
                 p.data.copy_(torch.from_numpy(arr).to(device=device, dtype=torch.float32))
                 continue
 
             if skip >= n:
-                # skip the whole chunk
                 skip -= n
             else:
-                # write into this chunk starting at position `skip`
                 start = skip
                 can_write_here = n - start
                 to_write = min(can_write_here, remaining)
@@ -62,7 +60,6 @@ def embed_bytes_into_model_last_byte(model: nn.Module, secret: bytes, from_end: 
                     remaining -= to_write
                 skip = 0  # consumed
 
-            # write back this parameter (arr mutated in-place)
             p.data.copy_(torch.from_numpy(arr).to(device=device, dtype=torch.float32))
 
     assert written == len(secret)
@@ -75,7 +72,8 @@ def extract_all_bytes_from_model_last_byte(model: nn.Module) -> bytes:
         arr = p.detach().cpu().to(torch.float32).numpy()
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         flat = arr.view(np.uint8).reshape(-1)
-        idx = np.arange(3, flat.size, 4, dtype=np.int64)
+        # --- CHANGED: use BYTE_INDEX instead of 3 ---
+        idx = np.arange(BYTE_INDEX, flat.size, 4, dtype=np.int64)
         if idx.size:
             out.extend(flat[idx].tolist())
     return bytes(out)
@@ -94,7 +92,6 @@ def build_tail_payload_from_mri_data(dataset, max_images=None):
     N = len(dataset) if max_images is None else min(max_images, len(dataset))
     for i in range(N):
         img_t, _ = dataset[i]             # CxHxW, float32 [0,1]
-        # clamp->uint8 HxWxC
         arr = (img_t.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
         H, W, C = arr.shape
         b = arr.tobytes()
