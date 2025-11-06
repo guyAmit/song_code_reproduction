@@ -158,6 +158,7 @@ class SignEncodingPenalty(nn.Module):
         model: nn.Module,
         dataset: torch.utils.data.Dataset,
         subset_selector: Callable[[nn.Module], List[torch.Tensor]] = select_linear_head_params,
+        auto_lambda: bool = True,
         lambda_max: float = 3.0,
         margin: float = 1e-3,
         redundancy_k: int = 8,
@@ -166,6 +167,7 @@ class SignEncodingPenalty(nn.Module):
     ):
         super().__init__()
         self.device = device or torch.device("cpu")
+        self.auto_lambda = bool(auto_lambda)
         self.lambda_max = float(lambda_max)
         self.margin = float(margin)
         self.k = int(redundancy_k)
@@ -215,13 +217,17 @@ class SignEncodingPenalty(nn.Module):
             return self.lambda_max
         t = max(0.0, min(1.0, step / float(total_steps)))
         return self.lambda_max * t
+    
 
     def forward(self, step: int, total_steps: int) -> torch.Tensor:
         theta = self._theta_subset()                  # gradient flows through p.view(-1)
         s = self.s_full.to(torch.float32)             # fixed targets
-        lam = self._lambda(step, total_steps)
-        # Penalty: mean(ReLU(margin - theta_i * s_i))
+        if self.auto_lambda:
+            lam = self._lambda(step, total_steps)
+        else:
+            lam = 1.0
         return lam * torch.relu(self.margin - theta * s).mean()
+        
 
     # ---------------- Reconstruction ----------------
 
